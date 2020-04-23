@@ -1,0 +1,275 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Setup AWS Batch environment for Parabricks
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID. VPC should have two private subnets with a S3 VPC endpoint
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: 'Subnets you want your batch compute environment to launch in. We recommend private subnets. NOTE: Must be from the VPC provided.'
+  S3BucketName:
+    Type: String
+    Description: Name of the S3 bucket that has / will hold input fastq files as well as the reference
+  ContainerURI:
+    Type: String
+    Description: Container URI
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Description: Parabricks AMI
+    Default: ami-08ff18ff8e98d47df
+  Ec2KeyPair:
+    Description: Key Pair used to log into worker instances (good for debugging purposes)
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: GENERAL.NONE
+  MaxvCpus:
+    Type: String
+    Description: Max vCpus in compute environment. Default is 240 (5 instances)
+    Default: 240
+  ReferenceS3URI:
+    Type: String
+    Description: S3 Keyspace URI with the reference files. Should be in S3BucketName
+
+Mappings:
+  Batch:
+    ComputeEnvironment:
+      InstanceType: g4dn.12xlarge
+      MinvCpus: 0
+    JobDefinition:
+      Vcpus: 48
+      Memory: 180000
+      GPU: 4
+            
+Resources:
+  BatchInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: !Sub S3Bucket-Access-${AWS::Region}
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: S3BucketAllowAllObjectOps
+                Effect: Allow
+                Resource: 
+                - !Join ["", ["arn:aws:s3:::", !Ref S3BucketName]]
+                - !Join ["", ["arn:aws:s3:::", !Ref S3BucketName, "/*"]]
+                Action:
+                  - "s3:*"
+      ManagedPolicyArns:
+      - "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+      - "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"
+
+  BatchInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+      - !Ref BatchInstanceRole
+
+  BatchSpotFleetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "spotfleet.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+      - "arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole"
+
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: batch.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+
+  EC2LaunchTemplateGPUWorker:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        UserData:
+          Fn::Base64: !Sub |
+            MIME-Version: 1.0
+            Content-Type: multipart/mixed; boundary="==BOUNDARY=="
+
+            --==BOUNDARY==
+            Content-Type: text/x-shellscript; charset="us-ascii"
+
+            #!/bin/bash
+            pip install --upgrade awscli
+            if [ $(lsblk | grep "nvme" > /dev/null; echo $?) -eq 0 ]; then
+              /usr/local/parabricks/prepare_script.sh /dev/nvme1n1 /mnt/disks/local -f
+            fi
+            aws s3 cp --recursive ${ReferenceS3URI} /mnt/disks/local/reference/
+            --==BOUNDARY==--
+  BatchWorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Parabricks Batch Security Group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+
+  BatchComputeEnvGPUSpot:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      ServiceRole: !Ref BatchServiceRole
+      Type: MANAGED
+      State: ENABLED
+      ComputeResources:
+        ImageId: !Ref ImageId
+        BidPercentage: 100
+        Ec2KeyPair: !Ref Ec2KeyPair
+        LaunchTemplate:
+          LaunchTemplateId: !Ref EC2LaunchTemplateGPUWorker
+        InstanceRole: !Ref BatchInstanceProfile
+        InstanceTypes:
+        - !FindInMap [ Batch, ComputeEnvironment, InstanceType ]
+        MinvCpus: 0
+        MaxvCpus: !Ref MaxvCpus
+        SecurityGroupIds:
+        - !Ref BatchWorkerSecurityGroup
+        SpotIamFleetRole: !Ref BatchSpotFleetRole
+        Subnets: !Ref SubnetIds
+        Type: SPOT
+        Tags:
+          Name: batch-gpu-worker
+  BatchComputeEnvGPUOnDemand:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      ServiceRole: !Ref BatchServiceRole
+      Type: MANAGED
+      State: ENABLED
+      ComputeResources:
+        ImageId: !Ref ImageId
+        Ec2KeyPair: !Ref Ec2KeyPair
+        LaunchTemplate:
+          LaunchTemplateId: !Ref EC2LaunchTemplateGPUWorker
+        InstanceRole:  !Ref BatchInstanceProfile
+        InstanceTypes:
+        - !FindInMap [ Batch, ComputeEnvironment, InstanceType ]
+        MinvCpus: 0
+        MaxvCpus: !Ref MaxvCpus
+        SecurityGroupIds:
+        - !Ref BatchWorkerSecurityGroup
+        Subnets: !Ref SubnetIds
+        Type: EC2
+        Tags:
+          Name: batch-gpu-worker
+  BatchJobQueueGPU:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      Priority: 100
+      State: ENABLED
+      ComputeEnvironmentOrder:
+      - Order: 1
+        ComputeEnvironment: !Ref BatchComputeEnvGPUSpot
+      - Order: 2
+        ComputeEnvironment: !Ref BatchComputeEnvGPUOnDemand
+
+  ParabricksJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      JobDefinitionName: parabricks
+      Type: container
+      Parameters:
+        Reference: "/mnt/disks/local/reference/Homo_sapiens_assembly38.fasta"
+        KnownSites: "/mnt/disks/local/reference/Homo_sapiens_assembly38.known_indels.vcf.gz"
+        Pbrun: "/opt/parabricks/pbrun"
+        WorkingDir: "/mnt/disks/local"
+        NumCpus: !FindInMap [ Batch, JobDefinition, Vcpus ]
+        NumGpus: !FindInMap [ Batch, JobDefinition, GPU ]
+        CmdArgs: " "
+      ContainerProperties:
+        Image: !Ref ContainerURI
+        Command:
+        - "--fastq1_s3_path"
+        - "Ref::Fastq1Path"
+        - "--fastq2_s3_path"
+        - "Ref::Fastq2Path"
+        - "--reference"
+        - "Ref::Reference"
+        - "--known_sites"
+        - "Ref::KnownSites"
+        - "--pbrun_path"
+        - "Ref::Pbrun"
+        - "--output_s3_folder_path"
+        - "Ref::OutputS3FolderPath"
+        - "--working_dir"
+        - "Ref::WorkingDir"
+        - "--num_cpu_threads"
+        - "Ref::NumCpus"
+        - "--num_gpus"
+        - "Ref::NumGpus"
+        - "Ref::CmdArgs"
+        Vcpus: 1
+        Memory: 1024 
+        Privileged: true
+        ResourceRequirements:
+        - Type: GPU
+          Value: !FindInMap [ Batch, JobDefinition, GPU ]
+        MountPoints:
+        - ReadOnly: False
+          SourceVolume: parabricks
+          ContainerPath: /opt/parabricks
+        - ReadOnly: False
+          SourceVolume: docker_scratch
+          ContainerPath: /mnt/disks/local
+        - ReadOnly: False
+          SourceVolume: docker_sock
+          ContainerPath: /var/run/docker.sock
+        Volumes:
+        - Host:
+            SourcePath: /opt/parabricks
+          Name: parabricks
+        - Host:
+            SourcePath: /mnt/disks/local
+          Name: docker_scratch
+        - Host:
+            SourcePath: /var/run/docker.sock
+          Name: docker_sock
+
+
+Outputs:
+  ParabricksComputeEnvironmentSpot:
+    Value: !Ref BatchComputeEnvGPUSpot
+  ParabricksComputeEnvironmentOnDemand:
+    Value: !Ref BatchComputeEnvGPUOnDemand
+  ParabricksJobQueue:
+    Value: !Ref BatchJobQueueGPU
+  ParabricksJobDefinition:
+    Value: !Ref ParabricksJobDefinition
+  ParabricksS3Bucket:
+    Value: !Ref S3BucketName
